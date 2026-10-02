@@ -1,0 +1,130 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+      libssl-dev \
+      ninja-build \
+      pkgconf; \
+    rm -rf /var/lib/apt/lists/*
+
+# SRT attaches only Windows installers to its releases and does not sign its
+# tags, so the release tag is cloned and must point to the commit pinned in
+# package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v${VERSION}" \
+      https://github.com/Haivision/srt.git /src/srt; \
+    test "$(git -C /src/srt rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag v${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }; \
+    grep -Fqx "set (SRT_VERSION ${VERSION})" /src/srt/CMakeLists.txt \
+      || { echo "CMakeLists.txt does not set version ${VERSION}" >&2; exit 1; }
+
+# libsrt is linked into the tools statically, so the image has no libsrt.so
+# that could take the place of another one, such as FFmpeg's in the default
+# image. The unit tests are left out because they download googletest, and
+# srt-ffplay because it is a script that runs ffplay.
+ARG JOBS
+WORKDIR /src/srt
+RUN cmake -S . -B /build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DENABLE_APPS=ON \
+      -DENABLE_ENCRYPTION=ON \
+      -DUSE_ENCLIB=openssl-evp \
+      -DENABLE_SHARED=OFF \
+      -DENABLE_STATIC=ON \
+      -DENABLE_UNITTESTS=OFF \
+      -DENABLE_TESTING=OFF \
+      -DENABLE_EXAMPLES=OFF \
+      -DENABLE_BONDING=OFF; \
+    cmake --build /build -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install /build --strip; \
+    rm -rf /out/usr/local/include /out/usr/local/lib /out/usr/local/bin/srt-ffplay
+
+ARG BASE_IMAGE
+# Each tool must load libcrypto, which shows that encryption is compiled in,
+# and none may load a shared libsrt. The licenses of the UDT core, the MD5
+# code and the atomics wrapper are cut from the comments of their sources.
+# runtime-deps lists the packages that own the libraries the tools load,
+# minus the base image's packages, plus the packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    for f in /out/usr/local/bin/*; do echo "${f##*/}"; done > /tmp/tools; \
+    printf '%s\n' srt-file-transmit srt-live-transmit srt-tunnel | cmp -s - /tmp/tools \
+      || { echo "unexpected tools:" >&2; cat /tmp/tools >&2; exit 1; }; \
+    for tool in /out/usr/local/bin/*; do \
+      readelf -d "$tool" > /tmp/dynamic; \
+      grep -Eq 'NEEDED.*\[libcrypto\.so\.[0-9]+\]' /tmp/dynamic \
+        || { echo "${tool##*/} does not load libcrypto" >&2; exit 1; }; \
+      if grep -q libsrt /tmp/dynamic; then echo "${tool##*/} loads a shared libsrt" >&2; exit 1; fi; \
+    done; \
+    /out/usr/local/bin/srt-live-transmit -version 2> /tmp/srt-version; \
+    grep -Fqx "Built with SRT Library version: ${VERSION}" /tmp/srt-version \
+      || { cat /tmp/srt-version >&2; exit 1; }; \
+    meta=/out/usr/local/share/randomcontainers/srt; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/LICENSE"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /University of Illinois/) { printf "%s", b; exit } }' \
+      srtcore/common.cpp > "$meta/licenses/LICENSE.udt"; \
+    grep -q 'Redistribution and use in source and binary forms' "$meta/licenses/LICENSE.udt"; \
+    awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /Copyright/) { printf "%s", b; exit } }' \
+      srtcore/md5.cpp > "$meta/licenses/LICENSE.md5"; \
+    grep -q 'Aladdin Enterprises' "$meta/licenses/LICENSE.md5"; \
+    sed -n '1,/unlicense\.org/p' srtcore/atomic.h > "$meta/licenses/LICENSE.atomic"; \
+    grep -q 'released into the public domain' "$meta/licenses/LICENSE.atomic"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/Haivision/srt.git@${SOURCE_COMMIT}" \
+      "https://github.com/Haivision/srt/tree/${SOURCE_COMMIT}" \
+      "https://github.com/randomcontainers/srt/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | head -n 1)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "openssl: $(pkg-config --modversion libcrypto)"; \
+      grep -E '^(CMAKE_BUILD_TYPE|ENABLE_[A-Z0-9_]+|USE_ENCLIB):' /build/CMakeCache.txt; \
+      cat /tmp/srt-version; \
+    } > "$meta/buildinfo"; \
+    ldd /out/usr/local/bin/* > /tmp/ldd; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// { print $3 }' /tmp/ldd | LC_ALL=C sort -u > /tmp/libs; \
+    grep -q '/libcrypto\.so\.' /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/srt/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "srt-live-transmit"]
+CMD ["-h"]

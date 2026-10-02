@@ -1,0 +1,181 @@
+name: srt
+title: SRT (Secure Reliable Transport) tools
+summary: Streams live video over SRT with srt-live-transmit, and sends files and tunnels TCP connections over SRT with srt-file-transmit and srt-tunnel.
+homepage: https://github.com/Haivision/srt
+# libsrt and the tools (MPL-2.0), and the code compiled in with them: the UDT
+# core (BSD-3-Clause), the MD5 implementation (Zlib) and the atomics wrapper
+# (Unlicense).
+license: MPL-2.0 AND BSD-3-Clause AND Zlib AND Unlicense
+# MPL-2.0 requires the source of the compiled files to be available.
+source-release: true
+upstream:
+  source: github-release
+  repository: Haivision/srt
+  # Release tags look like v1.5.7; release candidates (v1.5.5-rc.2) do not
+  # match.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.5.7
+  # The releases carry only Windows installers and the tags are not signed,
+  # so the build clones the tag and checks that it is this commit.
+  git:
+    url: https://github.com/Haivision/srt.git
+    tag: v{version}
+    commit: 899348d8318eb9a3c5a5b6ec43c4a1114288773a
+image:
+  entrypoint: [srt-live-transmit]
+  cmd: [-h]
+test:
+  - |
+    srt-live-transmit -version 2> version.txt
+    if ! grep -Fxq "Built with SRT Library version: $VERSION" version.txt \
+      || ! grep -Fq "SRT Library version: $VERSION, clock type:" version.txt; then
+      cat version.txt >&2
+      exit 1
+    fi
+    for tool in srt-file-transmit srt-tunnel; do
+      command -v "$tool" > /dev/null || { echo "missing: $tool" >&2; exit 1; }
+    done
+    if command -v srt-ffplay > /dev/null; then echo "srt-ffplay should not be installed" >&2; exit 1; fi
+    if srt-tunnel > tunnel.txt 2>&1; then echo "srt-tunnel without arguments should fail" >&2; exit 1; fi
+    grep -Fq 'Usage: srt-tunnel <listen-uri> <call-uri>' tunnel.txt || { cat tunnel.txt >&2; exit 1; }
+  - |
+    # srt-live-transmit drops what it reads before its connection is up, so
+    # the sender reads from a FIFO that is filled once it has connected. It
+    # keeps running after the end of its input until -t; the receiver stops
+    # when the sender closes the connection (-a:no). SRT 1.5.7 sends a short
+    # read from standard input as a whole chunk padded with zeros, so the
+    # input is 100 chunks of 1316 bytes, written one chunk at a time: a pipe
+    # write of up to 4096 bytes is never split, so every read gets a whole
+    # chunk. The sender sets the key length, the receiver only the passphrase.
+    head -c 131600 /dev/urandom > in.bin
+    pass='passphrase=0123456789abcdef'
+    srt-live-transmit -a:no -t:30 -c:1316 "srt://127.0.0.1:9000?mode=listener&$pass&latency=1000" file://con > out.bin 2> rx.log &
+    rx=$!
+    mkfifo tx.fifo
+    srt-live-transmit -t:10 -c:1316 file://con "srt://127.0.0.1:9000?$pass&pbkeylen=32&latency=1000" 2> tx.log < tx.fifo &
+    tx=$!
+    exec 3> tx.fifo
+    tries=0
+    until grep -Fq 'SRT target connected' tx.log; do
+      tries=$((tries + 1))
+      if [ "$tries" -gt 20 ]; then cat tx.log rx.log >&2; exit 1; fi
+      sleep 1
+    done
+    dd if=in.bin bs=1316 2> /dev/null >&3 || { cat tx.log rx.log >&2; exit 1; }
+    exec 3>&-
+    wait "$tx" || { cat tx.log >&2; exit 1; }
+    wait "$rx" || { cat rx.log >&2; exit 1; }
+    cmp in.bin out.bin || { cat tx.log rx.log >&2; exit 1; }
+    grep -Fq 'Accepted SRT source connection' rx.log || { cat rx.log >&2; exit 1; }
+  - |
+    # A caller with another passphrase is rejected by the listener.
+    srt-live-transmit -a:no -t:6 -c:1316 'srt://127.0.0.1:9001?mode=listener&passphrase=0123456789abcdef' file://con > out2.bin 2> rx2.log &
+    rx=$!
+    # /proc/net/udp lists bound sockets in hex: 127.0.0.1:9001 is 0100007F:2329.
+    tries=0
+    until grep -q ' 0100007F:2329 ' /proc/net/udp; do
+      tries=$((tries + 1))
+      if [ "$tries" -gt 20 ]; then cat rx2.log >&2; exit 1; fi
+      sleep 1
+    done
+    head -c 13160 /dev/zero \
+      | srt-live-transmit -a:no -t:4 -c:1316 file://con 'srt://127.0.0.1:9001?passphrase=fedcba9876543210&pbkeylen=32' 2> tx2.log \
+      || :
+    wait "$rx" || { cat rx2.log >&2; exit 1; }
+    if [ -s out2.bin ] || grep -Fq 'Accepted SRT source connection' rx2.log; then
+      echo "the listener accepted a wrong passphrase" >&2
+      cat rx2.log >&2
+      exit 1
+    fi
+    grep -Fq BADSECRET rx2.log || { cat rx2.log tx2.log >&2; exit 1; }
+  - |
+    # srt-file-transmit uses SRT's file mode. The receiver writes into a
+    # directory, under the name the sender passes as the stream ID.
+    mkdir send recv
+    head -c 262144 /dev/urandom > send/data.bin
+    srt-file-transmit 'srt://127.0.0.1:9002?mode=listener' "file://$PWD/recv" > frx.log 2>&1 &
+    rx=$!
+    tries=0
+    until grep -q ' 0100007F:232A ' /proc/net/udp; do
+      tries=$((tries + 1))
+      if [ "$tries" -gt 20 ]; then cat frx.log >&2; exit 1; fi
+      sleep 1
+    done
+    srt-file-transmit "file://$PWD/send/data.bin" 'srt://127.0.0.1:9002?streamid=data.bin' > ftx.log 2>&1 \
+      || { cat ftx.log >&2; exit 1; }
+    wait "$rx" || { cat frx.log >&2; exit 1; }
+    cmp send/data.bin recv/data.bin || { cat ftx.log frx.log >&2; exit 1; }
+examples:
+  - title: Receive a stream on UDP port 9000 and write it to stream.ts
+    command: docker run --rm -p 9000:9000/udp ghcr.io/randomcontainers/srt 'srt://:9000' file://con > stream.ts
+  - title: Send a stream that arrives on local UDP port 5000 to an SRT listener
+    command: docker run --rm --network host ghcr.io/randomcontainers/srt udp://127.0.0.1:5000 'srt://<host>:9000'
+  - title: Record a stream that arrives on UDP port 9000 to an MKV file with FFmpeg (default image)
+    command: docker run --rm --init -p 9000:9000/udp --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/srt -c 'srt-live-transmit -a:no srt://:9000 file://con | ffmpeg -loglevel error -i - -c copy recording.mkv'
+combos:
+  - with: [ffmpeg]
+    default: true
+    base: ffmpeg
+    summary: SRT tools with FFmpeg, for encoding streams and sending or receiving them over SRT.
+    test:
+      - |
+        # srt-live-transmit sends an H.264 stream from FFmpeg to a second
+        # srt-live-transmit. As in the srt tests, the FIFO holds the stream
+        # back until the sender has connected, and the stream is cut to whole
+        # 1316-byte chunks because SRT 1.5.7 pads a short read with zeros.
+        ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x240:rate=25:duration=2 \
+          -c:v libx264 -f mpegts full.ts
+        size=$(wc -c < full.ts)
+        head -c $((size / 1316 * 1316)) full.ts > sent.ts
+        srt-live-transmit -a:no -t:30 -c:1316 'srt://127.0.0.1:9000?mode=listener' file://con > received.ts 2> rx.log &
+        rx=$!
+        mkfifo tx.fifo
+        srt-live-transmit -t:10 -c:1316 file://con 'srt://127.0.0.1:9000' 2> tx.log < tx.fifo &
+        tx=$!
+        exec 3> tx.fifo
+        tries=0
+        until grep -Fq 'SRT target connected' tx.log; do
+          tries=$((tries + 1))
+          if [ "$tries" -gt 20 ]; then cat tx.log rx.log >&2; exit 1; fi
+          sleep 1
+        done
+        dd if=sent.ts bs=1316 2> /dev/null >&3 || { cat tx.log rx.log >&2; exit 1; }
+        exec 3>&-
+        wait "$tx" || { cat tx.log >&2; exit 1; }
+        wait "$rx" || { cat rx.log >&2; exit 1; }
+        cmp sent.ts received.ts || { cat tx.log rx.log >&2; exit 1; }
+        # ffprobe lists an MPEG-TS stream twice, under its program and on its own.
+        probe() { ffprobe -v error -show_entries "$1" -of default=noprint_wrappers=1:nokey=1 received.ts | awk 'NF { print; exit }'; }
+        format=$(probe format=format_name)
+        codec=$(probe stream=codec_name)
+        if [ "$format" != mpegts ] || [ "$codec" != h264 ]; then
+          echo "expected mpegts and h264, got '$format' and '$codec'" >&2
+          exit 1
+        fi
+      - |
+        # FFmpeg's own SRT output, received by srt-live-transmit. The receiver
+        # stops when FFmpeg closes the connection and drops what it still
+        # holds back for the latency, so the end of the stream may be cut.
+        srt-live-transmit -a:no -t:30 'srt://127.0.0.1:9003?mode=listener' file://con > interop.ts 2> rx.log &
+        rx=$!
+        tries=0
+        until grep -q ' 0100007F:232B ' /proc/net/udp; do
+          tries=$((tries + 1))
+          if [ "$tries" -gt 20 ]; then cat rx.log >&2; exit 1; fi
+          sleep 1
+        done
+        ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc2=size=320x240:rate=25:duration=3 \
+          -c:v libx264 -tune zerolatency -f mpegts 'srt://127.0.0.1:9003?pkt_size=1316' 2> ffmpeg.log \
+          || { cat ffmpeg.log rx.log >&2; exit 1; }
+        wait "$rx" || { cat rx.log >&2; exit 1; }
+        # ffprobe lists an MPEG-TS stream twice, under its program and on its own.
+        probe() { ffprobe -v error -show_entries "$1" -of default=noprint_wrappers=1:nokey=1 interop.ts | awk 'NF { print; exit }'; }
+        format=$(probe format=format_name)
+        codec=$(probe stream=codec_name)
+        if [ "$format" != mpegts ] || [ "$codec" != h264 ]; then
+          echo "expected mpegts and h264, got '$format' and '$codec'" >&2
+          cat rx.log >&2
+          exit 1
+        fi
